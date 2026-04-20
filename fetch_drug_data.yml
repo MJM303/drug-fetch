@@ -1,0 +1,200 @@
+name: Fetch Drug Data
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  # Manual trigger with configurable inputs
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: 'Countries to fetch (comma-separated ISO codes)'
+        required: true
+        default: 'US,UA,RU,FR'
+      chunk_size:
+        description: 'Drug names per chunk (each chunk = 1 parallel job)'
+        required: true
+        default: '5000'
+      name_file:
+        description: 'Name list file path in the repo'
+        required: true
+        default: 'drug_names.txt'
+      commit_results:
+        description: 'Commit merged CSVs back to repo when done?'
+        required: true
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+        default: 'no'
+
+  # Optional: run on a schedule (uncomment to enable)
+  # schedule:
+  #   - cron: '0 2 * * 0'   # Every Sunday at 02:00 UTC
+
+
+# ── Permissions ───────────────────────────────────────────────────────────────
+permissions:
+  contents: write   # needed only if commit_results = yes
+
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  # ── 1. Prepare: split name list into chunks, build matrix ──────────────────
+  prepare:
+    name: Split name list into chunks
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      total_names: ${{ steps.split.outputs.total_names }}
+      total_chunks: ${{ steps.split.outputs.total_chunks }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Split name list and generate matrix
+        id: split
+        run: |
+          python3 scripts/split_names.py \
+            --file "${{ inputs.name_file }}" \
+            --chunk-size "${{ inputs.chunk_size }}" \
+            --output-dir chunks/
+
+      - name: Upload chunks as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: name-chunks
+          path: chunks/
+          retention-days: 1
+
+
+  # ── 2. Fetch: one job per chunk, all run in parallel ───────────────────────
+  fetch:
+    name: Fetch chunk ${{ matrix.chunk_index }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false   # keep running other chunks if one fails
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Download name chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: name-chunks
+          path: chunks/
+
+      - name: Run fetch_drug_data.py for this chunk
+        env:
+          OPENFDA_KEY: ${{ secrets.OPENFDA_KEY }}   # optional — set in repo secrets
+        run: |
+          mkdir -p output/
+
+          # Build the openFDA key argument if the secret is set
+          OPENFDA_ARG=""
+          if [ -n "$OPENFDA_KEY" ]; then
+            OPENFDA_ARG="--openfda-key $OPENFDA_KEY"
+          fi
+
+          python3 fetch_drug_data.py \
+            --file "chunks/chunk_${{ matrix.chunk_index }}.txt" \
+            --countries "${{ inputs.countries }}" \
+            --output output/ \
+            $OPENFDA_ARG
+
+      - name: Upload chunk results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-chunk-${{ matrix.chunk_index }}
+          path: output/
+          retention-days: 7
+          if-no-files-found: warn
+
+
+  # ── 3. Merge: combine all chunk outputs into final CSVs ────────────────────
+  merge:
+    name: Merge all chunk results
+    needs: [prepare, fetch]
+    runs-on: ubuntu-latest
+    if: always()   # run even if some fetch jobs failed
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download all chunk results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-chunk-*
+          path: all-results/
+          merge-multiple: false
+
+      - name: Merge results into final CSVs
+        id: merge
+        run: |
+          mkdir -p final-output/
+          python3 scripts/merge_results.py \
+            --input-dir all-results/ \
+            --output-dir final-output/
+
+      - name: Upload final merged CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: drug-data-${{ github.run_id }}
+          path: final-output/
+          retention-days: 30
+
+      - name: Print summary
+        run: |
+          echo "## Fetch Drug Data — Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Rows | With InChI Key |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|----------------|" >> $GITHUB_STEP_SUMMARY
+          python3 -c "
+          import csv, os
+          for f in sorted(os.listdir('final-output')):
+              if not f.endswith('.csv') or 'summary' in f:
+                  continue
+              with open(f'final-output/{f}', encoding='utf-8') as fh:
+                  rows = list(csv.DictReader(fh))
+              with_inchi = sum(1 for r in rows if r.get('InChI Key','').strip())
+              pct = with_inchi * 100 // len(rows) if rows else 0
+              print(f'| {f} | {len(rows)} | {with_inchi} ({pct}%) |')
+          " >> $GITHUB_STEP_SUMMARY
+
+      # Optional: commit results back into the repo
+      - name: Commit results to repo
+        if: ${{ inputs.commit_results == 'yes' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p data/drug-csvs/
+          cp final-output/*.csv data/drug-csvs/
+
+          git add data/drug-csvs/
+          git diff --staged --quiet || git commit -m \
+            "chore: update drug CSVs from fetch run ${{ github.run_id }} [skip ci]"
+          git push
